@@ -36,7 +36,7 @@ on:
       mode:
         description: "list / extract-one / slice-upload"
         type: choice
-        options: [list, extract-one, slice-upload]
+        options: [list, extract-one, slice-upload, repair-companions]
         default: list
       match:
         description: "extract-one: file name or suffix inside the zip"
@@ -114,7 +114,7 @@ jobs:
 
   transfer:
     needs: prepare
-    if: ${{ needs.prepare.outputs.mode != 'list' }}
+    if: ${{ needs.prepare.outputs.mode == 'extract-one' || needs.prepare.outputs.mode == 'slice-upload' }}
     runs-on: ubuntu-latest
     timeout-minutes: 355
     strategy:
@@ -171,14 +171,14 @@ jobs:
           ASSET="slice-${START}-${SIZE}.bin"
           # Skip if an asset of this name+size already exists (resumable:
           # re-running after a link refresh only does the missing slices).
-          EXISTING=$(gh api "repos/$TARGET_REPO/releases/$RELEASE_ID/assets" \
-            --jq ".[] | select(.name==\"$ASSET\") | .size" || true)
+          EXISTING=$(gh api --paginate "repos/$TARGET_REPO/releases/$RELEASE_ID/assets?per_page=100" \
+            | jq -rs --arg n "$ASSET" '[.[][] | select(.name==$n)] | first | .size // empty')
           if [ "$EXISTING" = "$SIZE" ]; then echo "already present, skip"; exit 0; fi
           # A wrong-size asset with this name (truncated earlier upload) would
           # make the re-upload 422 forever — delete it first. (Slice-lane patch.)
           if [ -n "$EXISTING" ]; then
-            OLD_ID=$(gh api "repos/$TARGET_REPO/releases/$RELEASE_ID/assets" \
-              --jq ".[] | select(.name==\"$ASSET\") | .id")
+            OLD_ID=$(gh api --paginate "repos/$TARGET_REPO/releases/$RELEASE_ID/assets?per_page=100" \
+              | jq -rs --arg n "$ASSET" '[.[][] | select(.name==$n)] | first | .id // empty')
             echo "deleting wrong-size asset id $OLD_ID (was $EXISTING bytes)"
             gh api -X DELETE "repos/$TARGET_REPO/releases/assets/$OLD_ID"
           fi
@@ -192,14 +192,14 @@ jobs:
           python3 range_list.py upload-slice "$START" "$SIZE" --hash-out slice.sha256
           cat slice.sha256
           # Verify: size-exact check via API.
-          GOT=$(gh api "repos/$TARGET_REPO/releases/$RELEASE_ID/assets" \
-            --jq ".[] | select(.name==\"$ASSET\") | .size")
+          GOT=$(gh api --paginate "repos/$TARGET_REPO/releases/$RELEASE_ID/assets?per_page=100" \
+            | jq -rs --arg n "$ASSET" '[.[][] | select(.name==$n)] | first | .size // empty')
           [ "$GOT" = "$SIZE" ] && echo "SIZE VERIFIED: $GOT" || { echo "SIZE MISMATCH: got $GOT want $SIZE"; exit 1; }
           # Companion checksum asset: "<sha256>  <asset-name>" (feeds MANIFEST).
           SHA_ASSET="${ASSET}.sha256.txt"
           printf "%s  %s\n" "$(cat slice.sha256)" "$ASSET" > "$SHA_ASSET"
-          OLD_SHA_ID=$(gh api "repos/$TARGET_REPO/releases/$RELEASE_ID/assets" \
-            --jq ".[] | select(.name==\"$SHA_ASSET\") | .id" || true)
+          OLD_SHA_ID=$(gh api --paginate "repos/$TARGET_REPO/releases/$RELEASE_ID/assets?per_page=100" \
+            | jq -rs --arg n "$SHA_ASSET" '[.[][] | select(.name==$n)] | first | .id // empty')
           [ -n "$OLD_SHA_ID" ] && gh api -X DELETE "repos/$TARGET_REPO/releases/assets/$OLD_SHA_ID" || true
           curl -sS --fail -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \
@@ -207,3 +207,46 @@ jobs:
             --data-binary @"$SHA_ASSET" \
             "https://uploads.github.com/repos/$TARGET_REPO/releases/$RELEASE_ID/assets?name=$SHA_ASSET"
           echo "checksum asset uploaded: $SHA_ASSET"
+
+  repair:
+    needs: prepare
+    if: ${{ needs.prepare.outputs.mode == 'repair-companions' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        slice_start: ${{ fromJSON(needs.prepare.outputs.slice_starts) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Repair one slice's missing .sha256.txt companion
+        env:
+          GH_TOKEN: ${{ secrets.TARGET_PAT || secrets.GITHUB_TOKEN }}
+          TARGET_REPO: ${{ vars.TARGET_REPO || github.repository }}
+          RELEASE_TAG: ${{ vars.RELEASE_TAG || 'range-pull-v1' }}
+          START: ${{ matrix.slice_start }}
+          SIZE: ${{ needs.prepare.outputs.slice_size }}
+        run: |
+          ASSET="slice-${START}-${SIZE}.bin"
+          SHA_ASSET="${ASSET}.sha256.txt"
+          RID=$(gh api "repos/$TARGET_REPO/releases/tags/$RELEASE_TAG" --jq .id)
+          HAVE_SHA=$(gh api --paginate "repos/$TARGET_REPO/releases/$RID/assets?per_page=100" \
+            | jq -rs --arg n "$SHA_ASSET" '[.[][] | select(.name==$n)] | length')
+          if [ "$HAVE_SHA" != "0" ]; then echo "companion present, skip"; exit 0; fi
+          HAVE_BIN=$(gh api --paginate "repos/$TARGET_REPO/releases/$RID/assets?per_page=100" \
+            | jq -rs --arg n "$ASSET" '[.[][] | select(.name==$n)] | first | .size // empty')
+          [ "$HAVE_BIN" = "$SIZE" ] || { echo "bin missing/wrong size ($HAVE_BIN) — not repairable here"; exit 1; }
+          # Hash the bytes AS STORED on the release (independent verification):
+          # download this one asset to the runner disk (2 GiB fits), sha256 it,
+          # upload the companion, clean up.
+          gh release download "$RELEASE_TAG" --repo "$TARGET_REPO" --pattern "$ASSET" --dir .
+          SHA=$(sha256sum "$ASSET" | cut -d" " -f1)
+          printf "%s  %s\n" "$SHA" "$ASSET" > "$SHA_ASSET"
+          curl -sS --fail -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Content-Type: text/plain" \
+            --data-binary @"$SHA_ASSET" \
+            "https://uploads.github.com/repos/$TARGET_REPO/releases/$RID/assets?name=$SHA_ASSET"
+          rm -f "$ASSET"
+          echo "companion repaired: $SHA_ASSET ($SHA)"
