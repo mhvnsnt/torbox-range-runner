@@ -1,0 +1,166 @@
+# TorBox / debrid CDN -> GitHub Releases, zero local disk.
+#
+# HOW THE SECRET FLOWS (the whole point of this prototype):
+#   A human pastes the download link ONCE into this repo's own settings:
+#     Settings -> Secrets and variables -> Actions -> New repository secret
+#     Name: SOURCE_URL   Value: <the CDN / debrid link, pasted in the browser>
+#   The link never appears in chat, in agent tool calls, in git, or in this
+#   file. GitHub injects it into the runner as an env var and masks the exact
+#   value in logs. range_list.py additionally never prints it (host only).
+#
+# Optional second secret, only needed when the target release lives in a
+# DIFFERENT (e.g. private) repo than this runner repo:
+#   Name: TARGET_PAT  Value: fine-grained PAT, scoped to that one repo,
+#   Contents: Read and write, short expiry. Created in GitHub's UI.
+# If TARGET_REPO is left unset, assets go to a release in THIS repo using
+# the automatic GITHUB_TOKEN.
+#
+# Repo variables (Settings -> Secrets and variables -> Actions -> Variables):
+#   TARGET_REPO   e.g. owner/private-assets        (default: this repo)
+#   RELEASE_TAG   e.g. torbox-pull-v1              (default: range-pull-v1)
+
+name: torbox-range
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "list = read central directory only (smoke test, ~KBs). extract-one = stream one file out as a release asset. slice-upload = stream a raw byte slice of the source as a release asset."
+        type: choice
+        options: [list, extract-one, slice-upload]
+        default: list
+      match:
+        description: "extract-one: file name or suffix inside the zip"
+        type: string
+        default: ""
+      slice_size:
+        description: "slice-upload: bytes per release asset (default 100 MB, the owner's GitHub chunk standard; hard GitHub limit is < 2 GiB per asset)"
+        type: string
+        default: "100000000"
+      slice_starts:
+        description: "slice-upload: JSON list of byte offsets, one matrix job each, e.g. [\"0\",\"100000000\",\"200000000\"]"
+        type: string
+        default: '["0"]'
+
+permissions:
+  contents: write   # lets GITHUB_TOKEN create the release + upload assets here
+
+jobs:
+  list:
+    if: ${{ inputs.mode == 'list' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Runner headroom (streaming needs ~0 of this)
+        run: df -h . && free -h && python3 --version
+      - name: Read zip central directory via Range (secret URL)
+        env:
+          SOURCE_URL: ${{ secrets.SOURCE_URL }}
+        run: python3 range_list.py list --out manifest.json --limit 20
+      - name: Keep the manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: zip-manifest
+          path: manifest.json
+          retention-days: 7
+
+  transfer:
+    if: ${{ inputs.mode != 'list' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 355   # hard GitHub cap is 360 per job; fan out, don't stretch
+    strategy:
+      fail-fast: false
+      max-parallel: 20     # Free-plan concurrent-job ceiling
+      matrix:
+        slice_start: ${{ fromJSON(inputs.slice_starts) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve target release
+        id: rel
+        env:
+          GH_TOKEN: ${{ secrets.TARGET_PAT || secrets.GITHUB_TOKEN }}
+          TARGET_REPO: ${{ vars.TARGET_REPO || github.repository }}
+          RELEASE_TAG: ${{ vars.RELEASE_TAG || 'range-pull-v1' }}
+        run: |
+          echo "repo=$TARGET_REPO" >> "$GITHUB_OUTPUT"
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          gh release view "$RELEASE_TAG" --repo "$TARGET_REPO" >/dev/null 2>&1 \
+            || gh release create "$RELEASE_TAG" --repo "$TARGET_REPO" \
+                 --title "$RELEASE_TAG" --notes "Streamed via Range, zero local disk. Per-asset sha256 in the run logs / manifest."
+          gh api "repos/$TARGET_REPO/releases/tags/$RELEASE_TAG" --jq .id > release_id.txt
+          echo "id=$(cat release_id.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: extract-one — stream file from source zip straight to a release asset
+        if: ${{ inputs.mode == 'extract-one' }}
+        env:
+          SOURCE_URL: ${{ secrets.SOURCE_URL }}
+          GH_TOKEN: ${{ secrets.TARGET_PAT || secrets.GITHUB_TOKEN }}
+          TARGET_REPO: ${{ steps.rel.outputs.repo }}
+          RELEASE_ID: ${{ steps.rel.outputs.id }}
+          MATCH: ${{ inputs.match }}
+        run: |
+          ASSET="$(basename "$MATCH")"
+          # Pass 1 (hash + CRC, proven pattern from github_upload_stream.py):
+          python3 range_list.py extract-one "$MATCH" --out - > /dev/null
+          # Pass 2 (upload): decompressed stream -> uploads.github.com, no disk.
+          python3 range_list.py extract-one "$MATCH" --out - \
+            | curl -sS --fail -X POST \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Content-Type: application/octet-stream" \
+                --data-binary @- \
+                "https://uploads.github.com/repos/$TARGET_REPO/releases/$RELEASE_ID/assets?name=$ASSET"
+          echo "uploaded asset: $ASSET"
+
+      - name: slice-upload — stream one raw source slice straight to a release asset
+        if: ${{ inputs.mode == 'slice-upload' }}
+        env:
+          SOURCE_URL: ${{ secrets.SOURCE_URL }}
+          GH_TOKEN: ${{ secrets.TARGET_PAT || secrets.GITHUB_TOKEN }}
+          TARGET_REPO: ${{ steps.rel.outputs.repo }}
+          RELEASE_ID: ${{ steps.rel.outputs.id }}
+          START: ${{ matrix.slice_start }}
+          SIZE: ${{ inputs.slice_size }}
+        run: |
+          ASSET="slice-${START}-${SIZE}.bin"
+          # Skip if an asset of this name+size already exists (resumable:
+          # re-running after a link refresh only does the missing slices).
+          EXISTING=$(gh api "repos/$TARGET_REPO/releases/$RELEASE_ID/assets" \
+            --jq ".[] | select(.name==\"$ASSET\") | .size" || true)
+          if [ "$EXISTING" = "$SIZE" ]; then echo "already present, skip"; exit 0; fi
+          # A wrong-size asset with this name (truncated earlier upload) would
+          # make the re-upload 422 forever — delete it first. (Slice-lane patch.)
+          if [ -n "$EXISTING" ]; then
+            OLD_ID=$(gh api "repos/$TARGET_REPO/releases/$RELEASE_ID/assets" \
+              --jq ".[] | select(.name==\"$ASSET\") | .id")
+            echo "deleting wrong-size asset id $OLD_ID (was $EXISTING bytes)"
+            gh api -X DELETE "repos/$TARGET_REPO/releases/assets/$OLD_ID"
+          fi
+          # Pass 1: hash the slice (stderr line + file), bytes to /dev/null.
+          python3 range_list.py slice "$START" "$SIZE" --hash-out slice.sha256 > /dev/null
+          cat slice.sha256
+          # Pass 2: stream the same slice into the release, zero disk.
+          python3 range_list.py slice "$START" "$SIZE" 2>/dev/null \
+            | curl -sS --fail -X POST \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Content-Type: application/octet-stream" \
+                --data-binary @- \
+                "https://uploads.github.com/repos/$TARGET_REPO/releases/$RELEASE_ID/assets?name=$ASSET"
+          # Pass 3: size-exact check via API (full range-hash verification
+          # pattern lives in hero-parts-pull/github_upload_stream.py).
+          GOT=$(gh api "repos/$TARGET_REPO/releases/$RELEASE_ID/assets" \
+            --jq ".[] | select(.name==\"$ASSET\") | .size")
+          [ "$GOT" = "$SIZE" ] && echo "SIZE VERIFIED: $GOT" || { echo "SIZE MISMATCH: got $GOT want $SIZE"; exit 1; }
+          # Companion checksum asset: "<sha256>  <asset-name>" (Slice-lane patch,
+          # feeds the release MANIFEST). Re-upload replaces via delete-first.
+          SHA_ASSET="${ASSET}.sha256.txt"
+          printf "%s  %s\n" "$(cat slice.sha256)" "$ASSET" > "$SHA_ASSET"
+          OLD_SHA_ID=$(gh api "repos/$TARGET_REPO/releases/$RELEASE_ID/assets" \
+            --jq ".[] | select(.name==\"$SHA_ASSET\") | .id" || true)
+          [ -n "$OLD_SHA_ID" ] && gh api -X DELETE "repos/$TARGET_REPO/releases/assets/$OLD_SHA_ID" || true
+          curl -sS --fail -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Content-Type: text/plain" \
+            --data-binary @"$SHA_ASSET" \
+            "https://uploads.github.com/repos/$TARGET_REPO/releases/$RELEASE_ID/assets?name=$SHA_ASSET"
+          echo "checksum asset uploaded: $SHA_ASSET"
