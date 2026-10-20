@@ -318,15 +318,18 @@ def cmd_upload_slice(url, start, size, hash_out=None):
     conn.putrequest("POST", path)
     conn.putheader("Authorization", f"Bearer {token}")
     conn.putheader("Content-Type", "application/octet-stream")
-    conn.putheader("Transfer-Encoding", "chunked")
+    # uploads.github.com REQUIRES Content-Length (chunked -> HTTP 400
+    # 'Bad Content-Length', run 39486224869 job logs). The slice size is
+    # known exactly, so declare it and stream the body raw — still no
+    # buffering anywhere, RAM stays at one 4 MiB slice.
+    conn.putheader("Content-Length", str(size))
     conn.endheaders()
     h = hashlib.sha256()
     n = 0
     for chunk in fetch_iter(url, start, start + size - 1, 4 * 1024 * 1024):
         h.update(chunk)
         n += len(chunk)
-        conn.send(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
-    conn.send(b"0\r\n\r\n")
+        conn.send(chunk)
     resp = conn.getresponse()
     body = resp.read()[:400]
     digest = h.hexdigest()
