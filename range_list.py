@@ -297,6 +297,50 @@ def cmd_slice(url, start, size, hash_out=None):
     return 0 if n == size else 1
 
 
+def cmd_upload_slice(url, start, size, hash_out=None):
+    """Single-pass: stream source range [start, start+size) straight into an
+    uploads.github.com POST using chunked transfer encoding, hashing as the
+    bytes flow. Replaces the Lane 4 curl pipe, whose --data-binary @- buffers
+    the ENTIRE stdin body in RAM (2 GiB slice -> 'curl: option --data-binary:
+    out of memory', verified in run 39479148383 job logs, slice lane 2026-10-20).
+    Target URL + bearer token come from env (UPLOAD_URL, GH_TOKEN); neither is
+    printed. Prints 'slice bytes=N sha256=H' on stderr like slice mode."""
+    import http.client
+    import urllib.parse as _up
+    upload_url = os.environ.get("UPLOAD_URL", "").strip()
+    token = os.environ.get("GH_TOKEN", "").strip()
+    if not upload_url or not token:
+        print("ERROR: UPLOAD_URL / GH_TOKEN env not set", file=sys.stderr)
+        return 2
+    p = _up.urlsplit(upload_url)
+    conn = http.client.HTTPSConnection(p.netloc, timeout=300)
+    path = p.path + ("?" + p.query if p.query else "")
+    conn.putrequest("POST", path)
+    conn.putheader("Authorization", f"Bearer {token}")
+    conn.putheader("Content-Type", "application/octet-stream")
+    conn.putheader("Transfer-Encoding", "chunked")
+    conn.endheaders()
+    h = hashlib.sha256()
+    n = 0
+    for chunk in fetch_iter(url, start, start + size - 1, 4 * 1024 * 1024):
+        h.update(chunk)
+        n += len(chunk)
+        conn.send(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
+    conn.send(b"0\r\n\r\n")
+    resp = conn.getresponse()
+    body = resp.read()[:400]
+    digest = h.hexdigest()
+    print(f"slice bytes={n} sha256={digest} upload_status={resp.status}",
+          file=sys.stderr)
+    if hash_out:
+        with open(hash_out, "w") as f:
+            f.write(digest + "\n")
+    if resp.status >= 400 or n != size:
+        print(f"upload failed: HTTP {resp.status} body={body!r}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv):
     url = os.environ.get("SOURCE_URL", "").strip()
     if not url:
@@ -332,6 +376,12 @@ def main(argv):
         if "--hash-out" in args:
             hash_out = args[args.index("--hash-out") + 1]
         return cmd_slice(url, start, size, hash_out)
+    if cmd == "upload-slice":
+        start, size = int(args[0]), int(args[1])
+        hash_out = None
+        if "--hash-out" in args:
+            hash_out = args[args.index("--hash-out") + 1]
+        return cmd_upload_slice(url, start, size, hash_out)
     print(f"unknown command {cmd!r}", file=sys.stderr)
     return 2
 

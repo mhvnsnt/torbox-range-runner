@@ -22,7 +22,8 @@
 #    "slice_size":"2000000000",
 #    "slice_starts":["0","2000000000", ...]}
 # The newest runs/*.json in the pushed tree wins. workflow_dispatch is kept
-# for any future properly-scoped token. A concurrency group serializes runs.
+# for any future properly-scoped token. Runs are NOT serialized (see the
+# concurrency note above the permissions block).
 
 name: torbox-range
 
@@ -50,10 +51,11 @@ on:
         type: string
         default: '["0"]'
 
-concurrency:
-  group: torbox-range
-  cancel-in-progress: false
-
+# NOTE (slice lane, 2026-10-20): no concurrency group. Run 39479148383's jobs
+# fail deterministically at the upload step and the run cannot be cancelled
+# with this token (Actions write is 403) — a group would queue the fixed run
+# behind ~85 minutes of doomed jobs. Runs are independent per-slice and the
+# skip logic makes overlaps safe.
 permissions:
   contents: write
 
@@ -180,17 +182,16 @@ jobs:
             echo "deleting wrong-size asset id $OLD_ID (was $EXISTING bytes)"
             gh api -X DELETE "repos/$TARGET_REPO/releases/assets/$OLD_ID"
           fi
-          # Pass 1: hash the slice (stderr line + file), bytes to /dev/null.
-          python3 range_list.py slice "$START" "$SIZE" --hash-out slice.sha256 > /dev/null
+          # Single pass: stream CDN range -> sha256 -> chunked POST to the
+          # release, in-process. (The Lane 4 two-pass curl pipe died here:
+          # 'curl: option --data-binary: out of memory' — curl buffers all of
+          # stdin for @- bodies, so a 2 GiB slice OOMs the runner. Verified in
+          # run 39479148383 job logs. upload-slice streams chunked, few MiB RAM,
+          # and fetches the slice from the CDN once instead of twice.)
+          export UPLOAD_URL="https://uploads.github.com/repos/$TARGET_REPO/releases/$RELEASE_ID/assets?name=$ASSET"
+          python3 range_list.py upload-slice "$START" "$SIZE" --hash-out slice.sha256
           cat slice.sha256
-          # Pass 2: stream the same slice into the release, zero disk.
-          python3 range_list.py slice "$START" "$SIZE" 2>/dev/null \
-            | curl -sS --fail -X POST \
-                -H "Authorization: Bearer $GH_TOKEN" \
-                -H "Content-Type: application/octet-stream" \
-                --data-binary @- \
-                "https://uploads.github.com/repos/$TARGET_REPO/releases/$RELEASE_ID/assets?name=$ASSET"
-          # Pass 3: size-exact check via API.
+          # Verify: size-exact check via API.
           GOT=$(gh api "repos/$TARGET_REPO/releases/$RELEASE_ID/assets" \
             --jq ".[] | select(.name==\"$ASSET\") | .size")
           [ "$GOT" = "$SIZE" ] && echo "SIZE VERIFIED: $GOT" || { echo "SIZE MISMATCH: got $GOT want $SIZE"; exit 1; }
