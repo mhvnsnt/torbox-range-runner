@@ -169,13 +169,19 @@ jobs:
           SIZE: ${{ needs.prepare.outputs.slice_size }}
         run: |
           ASSET="slice-${START}-${SIZE}.bin"
-          # Skip if an asset of this name+size already exists (resumable:
-          # re-running after a link refresh only does the missing slices).
+          # Skip if an asset of this name+size already exists AND is fully
+          # uploaded (resumable: re-running after a link refresh only does the
+          # missing slices). NOTE (2026-11-21): 14 bins are "starter" stubs —
+          # upload initiated Oct 20 but never completed — they declare the full
+          # size yet hold no bytes, so size alone must NOT count as present.
           EXISTING=$(gh api --paginate "repos/$TARGET_REPO/releases/$RELEASE_ID/assets?per_page=100" \
             | jq -rs --arg n "$ASSET" '[.[][] | select(.name==$n)] | first | .size // empty')
-          if [ "$EXISTING" = "$SIZE" ]; then echo "already present, skip"; exit 0; fi
-          # A wrong-size asset with this name (truncated earlier upload) would
-          # make the re-upload 422 forever — delete it first. (Slice-lane patch.)
+          EXISTING_STATE=$(gh api --paginate "repos/$TARGET_REPO/releases/$RELEASE_ID/assets?per_page=100" \
+            | jq -rs --arg n "$ASSET" '[.[][] | select(.name==$n)] | first | .state // empty')
+          if [ "$EXISTING" = "$SIZE" ] && [ "$EXISTING_STATE" = "uploaded" ]; then echo "already present, skip"; exit 0; fi
+          # A wrong-size asset — or a never-completed "starter" stub — with this
+          # name would make the re-upload 422 forever — delete it first.
+          # (Slice-lane patch, extended 2026-11-21 for starter stubs.)
           if [ -n "$EXISTING" ]; then
             OLD_ID=$(gh api --paginate "repos/$TARGET_REPO/releases/$RELEASE_ID/assets?per_page=100" \
               | jq -rs --arg n "$ASSET" '[.[][] | select(.name==$n)] | first | .id // empty')
@@ -191,10 +197,13 @@ jobs:
           export UPLOAD_URL="https://uploads.github.com/repos/$TARGET_REPO/releases/$RELEASE_ID/assets?name=$ASSET"
           python3 range_list.py upload-slice "$START" "$SIZE" --hash-out slice.sha256
           cat slice.sha256
-          # Verify: size-exact check via API.
+          # Verify: size-exact check via API, plus state must be "uploaded"
+          # (a "starter" stub also declares the full size — see above).
           GOT=$(gh api --paginate "repos/$TARGET_REPO/releases/$RELEASE_ID/assets?per_page=100" \
             | jq -rs --arg n "$ASSET" '[.[][] | select(.name==$n)] | first | .size // empty')
-          [ "$GOT" = "$SIZE" ] && echo "SIZE VERIFIED: $GOT" || { echo "SIZE MISMATCH: got $GOT want $SIZE"; exit 1; }
+          GOT_STATE=$(gh api --paginate "repos/$TARGET_REPO/releases/$RELEASE_ID/assets?per_page=100" \
+            | jq -rs --arg n "$ASSET" '[.[][] | select(.name==$n)] | first | .state // empty')
+          [ "$GOT" = "$SIZE" ] && [ "$GOT_STATE" = "uploaded" ] && echo "SIZE+STATE VERIFIED: $GOT / $GOT_STATE" || { echo "VERIFY FAILED: got $GOT / $GOT_STATE want $SIZE / uploaded"; exit 1; }
           # Companion checksum asset: "<sha256>  <asset-name>" (feeds MANIFEST).
           SHA_ASSET="${ASSET}.sha256.txt"
           printf "%s  %s\n" "$(cat slice.sha256)" "$ASSET" > "$SHA_ASSET"
