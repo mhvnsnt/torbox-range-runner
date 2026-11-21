@@ -240,7 +240,18 @@ jobs:
           # Hash the bytes AS STORED on the release (independent verification):
           # download this one asset to the runner disk (2 GiB fits), sha256 it,
           # upload the companion, clean up.
-          gh release download "$RELEASE_TAG" --repo "$TARGET_REPO" --pattern "$ASSET" --dir .
+          # NOTE (2026-11-21): `gh release download` CANNOT see 14 of these bins —
+          # the release object's embedded asset list omits them (gh CLI sees 324
+          # of 337 assets), so it fails with "no assets match the file pattern".
+          # Download by asset ID via the paginated assets endpoint instead.
+          BIN_ID=$(gh api --paginate "repos/$TARGET_REPO/releases/$RID/assets?per_page=100" \
+            | jq -rs --arg n "$ASSET" '[.[][] | select(.name==$n)] | first | .id // empty')
+          [ -n "$BIN_ID" ] || { echo "bin id not found for $ASSET"; exit 1; }
+          curl -sS --fail -L -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/octet-stream" \
+            "https://api.github.com/repos/$TARGET_REPO/releases/assets/$BIN_ID" \
+            -o "$ASSET"
+          [ "$(stat -c%s "$ASSET")" = "$SIZE" ] || { echo "downloaded size mismatch for $ASSET"; exit 1; }
           SHA=$(sha256sum "$ASSET" | cut -d" " -f1)
           printf "%s  %s\n" "$SHA" "$ASSET" > "$SHA_ASSET"
           curl -sS --fail -X POST \
