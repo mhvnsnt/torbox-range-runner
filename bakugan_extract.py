@@ -81,13 +81,16 @@ def asset_by_name(assets, name):
 
 def upload_file(release_id, token, path, name, content_type):
     url = f"https://uploads.github.com/repos/{TARGET_REPO}/releases/{release_id}/assets?name={name}"
-    env = dict(os.environ)
-    env["GH_UPLOAD_TOKEN"] = token
+    # NOTE: the token is interpolated here in Python. An earlier version passed
+    # the literal string "Bearer $GH_UPLOAD_TOKEN" as the header value — curl
+    # does not expand env vars in -H arguments, so GitHub answered 401 on
+    # every part upload (run 45024112890). The token value itself is never
+    # printed or logged.
     cmd = ["curl", "-sS", "--fail", "-X", "POST",
-           "-H", "Authorization: Bearer $GH_UPLOAD_TOKEN",
+           "-H", f"Authorization: Bearer {token}",
            "-H", f"Content-Type: {content_type}",
            "--data-binary", f"@{path}", url]
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=1800, env=env)
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
     if p.returncode != 0:
         raise RuntimeError(f"upload failed for {name}: {p.stderr.strip()[:500]}")
     return json.loads(p.stdout)
