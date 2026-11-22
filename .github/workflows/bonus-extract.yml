@@ -1,0 +1,132 @@
+# BONUS (non-CN) extraction — Documents.zip -> tar parts on the bonus-non-cn gap-fill release.
+#
+# TRIGGER: push a control file under runs-bonus/ (git push = Contents
+# permission, which works; same pattern as torbox-range.yml). The control
+# file is {"parts": []} for all parts, or {"parts": [3, 5]} to re-run only
+# those parts. workflow_dispatch is kept for manual runs from the GitHub UI.
+# NOTE: the prepare job picks `ls runs-bonus/*.json | sort | tail -1`, so a
+# retry MUST update the original control file in place — a `-retryN.json`
+# file sorts BEFORE it ('-' < '.') and would be ignored (Camp Lazlo lesson).
+#
+# DATA SOURCE: the TorBox SOURCE_URL secret (same secret torbox-range.yml
+# uses). The runner range-reads BONUS files straight out of the zip and
+# packs them into ~1.9 GB .tar parts. Nothing else is downloaded.
+#
+# TARGET: mhvnsnt/cn-gigaleak-bonus-non-cn, release bonus-non-cn-gap-fill-v1
+# (created 2026-11-22; id resolved by tag at runtime). Uploads use
+# secrets.TARGET_PAT (fine-grained PAT, Contents: RW). The `probe` job
+# uploads a small progress file FIRST: if the PAT is not scoped to the
+# bonus-non-cn repo, the run stops here with a clear error instead of
+# burning extraction jobs.
+#
+# THROTTLE: BONUS files are huge (150-868 MB), so each part job issues
+# ~48 MB chunk requests; bonus_extract.py sleeps 0.75 s per request and the
+# matrix runs max-parallel 2, keeping the TorBox link near the proven-safe
+# ~2 req/s (Camp Lazlo trip point was ~7.5-20 req/s).
+#
+# RESUME: each part job skips when its part asset + manifest already exist
+# on the release with matching sha256 (see bonus_extract.py).
+
+name: bonus-extract
+
+on:
+  push:
+    branches: [main]
+    paths: ["runs-bonus/*.json"]
+  workflow_dispatch:
+    inputs:
+      parts:
+        description: "JSON list of part numbers, e.g. [3,5]; empty = all parts"
+        type: string
+        default: "[]"
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.parts.outputs.matrix }}
+      count: ${{ steps.parts.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compute part boundaries from the CD list
+        id: parts
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            F=$(ls runs-bonus/*.json | sort | tail -1)
+            echo "control file: $F"
+            WANT=$(jq -c '.parts // []' "$F")
+          else
+            WANT='${{ inputs.parts }}'
+          fi
+          echo "wanted parts: $WANT"
+          python3 - "$WANT" <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, sys
+          CAP = 1900000000
+          want = json.loads(sys.argv[1]) if len(sys.argv) > 1 else []
+          entries = [l.rstrip("\n").split("\t") for l in open("bonus-cd-full.tsv")]
+          parts, start, acc = [], 0, 0
+          for i, row in enumerate(entries):
+              u = int(row[4])
+              if acc + u > CAP and acc > 0:
+                  parts.append({"no": len(parts)+1, "start": start, "end": i,
+                                "name": f"bonus-part-{len(parts)+1:02d}.tar"})
+                  start, acc = i, 0
+              acc += u
+          parts.append({"no": len(parts)+1, "start": start, "end": len(entries),
+                        "name": f"bonus-part-{len(parts)+1:02d}.tar"})
+          if want:
+              parts = [p for p in parts if p["no"] in want]
+          print(f"matrix={json.dumps(parts)}")
+          print(f"count={len(parts)}")
+          EOF
+          echo "parts: ${{ steps.parts.outputs.count }}"
+
+  probe:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prove write access to the bonus-non-cn release
+        env:
+          GH_TOKEN: ${{ secrets.TARGET_PAT }}
+        run: |
+          RID=$(gh api repos/mhvnsnt/cn-gigaleak-bonus-non-cn/releases/tags/bonus-non-cn-gap-fill-v1 --jq .id)
+          echo "bonus-non-cn release id: $RID"
+          printf "bonus extraction started %s\n47 CD files / 21894273515 bytes (gap-fill: missing subset)\n" "$(date -u +%FT%TZ)" > BONUS-EXTRACT-PROGRESS.txt
+          OLD=$(gh api --paginate "repos/mhvnsnt/cn-gigaleak-bonus-non-cn/releases/$RID/assets?per_page=100" \
+            | jq -rs '.[][] | select(.name=="BONUS-EXTRACT-PROGRESS.txt") | .id // empty' | head -1)
+          [ -n "$OLD" ] && gh api -X DELETE "repos/mhvnsnt/cn-gigaleak-bonus-non-cn/releases/assets/$OLD" || true
+          curl -sS --fail -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Content-Type: text/plain" \
+            --data-binary @BONUS-EXTRACT-PROGRESS.txt \
+            "https://uploads.github.com/repos/mhvnsnt/cn-gigaleak-bonus-non-cn/releases/$RID/assets?name=BONUS-EXTRACT-PROGRESS.txt"
+          echo "PROBE OK: TARGET_PAT can write to mhvnsnt/cn-gigaleak-bonus-non-cn"
+
+  extract:
+    needs: [prepare, probe]
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        part: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Runner headroom
+        run: df -h . && free -h && python3 --version
+      - name: Extract + upload part ${{ matrix.part.no }}
+        env:
+          SOURCE_URL: ${{ secrets.SOURCE_URL }}
+          GH_TOKEN: ${{ secrets.TARGET_PAT }}
+        run: |
+          RID=$(gh api repos/mhvnsnt/cn-gigaleak-bonus-non-cn/releases/tags/bonus-non-cn-gap-fill-v1 --jq .id)
+          python3 bonus_extract.py --tsv bonus-cd-full.tsv \
+            --start ${{ matrix.part.start }} --end ${{ matrix.part.end }} \
+            --part-no ${{ matrix.part.no }} --release-id "$RID"
