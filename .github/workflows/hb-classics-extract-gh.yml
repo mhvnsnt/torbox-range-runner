@@ -1,0 +1,114 @@
+# HB Classics gap fill — GitHub slices source (fallback).
+#
+# ROUTE SWITCH after run 45036909671: parts 01, 04, 05 failed on TorBox
+# transport errors (part 1: Errno 110 timeout on an 8.4 MB fetch; part 4:
+# Errno 110 timeout on a 182 KB fetch; part 5: Errno 111 connection refused
+# on a 30 B header fetch — different file each time, TorBox itself healthy,
+# parts 02/03/06 succeeded on the same link). Same pattern as Regular Show
+# part 5 (runs 45027315787/45028716458/45030323213), which the GitHub-slices
+# route closed in ~6 min (run 45032519075). Do NOT re-run the TorBox route
+# for these parts.
+#
+# SOURCE: Documents.zip slice assets on GitHub
+# (mhvnsnt/cn-gigaleak-documents-archive, release documents-zip-slices-v1)
+# via the API asset endpoint + Range header. No SOURCE_URL needed.
+#
+# TRIGGER: push a control file under runs-hb-classics/gh-*.json with
+# {"parts": [1, 4, 5]} (or any subset). The prepare job computes the same
+# 6-part matrix from hb-classics-cd-full.tsv as the TorBox workflow.
+# TARGET: mhvnsnt/cn-gigaleak-cartoon-vault, release hb-classics-gap-fill-v1
+# (id 454521048). Uploads use secrets.TARGET_PAT (Contents:RW on the target
+# repo AND read on mhvnsnt/cn-gigaleak-documents-archive). The gate job
+# fails fast if the PAT cannot read the slices repo.
+
+name: hb-classics-extract-gh
+
+on:
+  push:
+    branches: [main]
+    paths: ["runs-hb-classics/gh-*.json"]
+  workflow_dispatch:
+    inputs:
+      parts:
+        description: "JSON list of part numbers, e.g. [1,4,5]; empty = all parts"
+        type: string
+        default: "[]"
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.parts.outputs.matrix }}
+      count: ${{ steps.parts.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compute part boundaries from the CD list
+        id: parts
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            F=$(ls runs-hb-classics/gh-*.json | sort | tail -1)
+            echo "control file: $F"
+            WANT=$(jq -c '.parts // []' "$F")
+          else
+            WANT='${{ inputs.parts }}'
+          fi
+          echo "wanted parts: $WANT"
+          python3 - "$WANT" <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, sys
+          CAP = 1900000000
+          want = json.loads(sys.argv[1]) if len(sys.argv) > 1 else []
+          entries = [l.rstrip("\n").split("\t") for l in open("hb-classics-cd-full.tsv")]
+          parts, start, acc = [], 0, 0
+          for i, row in enumerate(entries):
+              u = int(row[4])
+              if acc + u > CAP and acc > 0:
+                  parts.append({"no": len(parts)+1, "start": start, "end": i,
+                                "name": f"hb-classics-gap-fill-part-{len(parts)+1:02d}.tar"})
+                  start, acc = i, 0
+              acc += u
+          parts.append({"no": len(parts)+1, "start": start, "end": len(entries),
+                        "name": f"hb-classics-gap-fill-part-{len(parts)+1:02d}.tar"})
+          if want:
+              parts = [p for p in parts if p["no"] in want]
+          print(f"matrix={json.dumps(parts)}")
+          print(f"count={len(parts)}")
+          EOF
+          echo "parts: ${{ steps.parts.outputs.count }}"
+
+  gate:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Gate — TARGET_PAT can read the slices repo
+        env:
+          GH_TOKEN: ${{ secrets.TARGET_PAT }}
+        run: |
+          gh api repos/mhvnsnt/cn-gigaleak-documents-archive/releases/tags/documents-zip-slices-v1 --jq '.id, .tag_name'
+          echo "GATE OK: TARGET_PAT can read the slices repo"
+
+  extract:
+    needs: [prepare, gate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      max-parallel: 18
+      matrix:
+        part: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Runner headroom
+        run: df -h . && free -h && python3 --version
+      - name: Extract + upload part ${{ matrix.part.no }} from GitHub slices
+        env:
+          GH_TOKEN: ${{ secrets.TARGET_PAT }}
+        run: |
+          python3 hb_classics_extract_gh.py --tsv hb-classics-cd-full.tsv \
+            --start ${{ matrix.part.start }} --end ${{ matrix.part.end }} \
+            --part-no ${{ matrix.part.no }} --release-id 454521048
