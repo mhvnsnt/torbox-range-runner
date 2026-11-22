@@ -1,0 +1,122 @@
+# Jimmy Two-Shoes extraction — Documents.zip slices -> tar parts on the jimmy-two-shoes release.
+#
+# TRIGGER: push a control file under runs-jimmy-two-shoes/ (git push = Contents
+# permission, which works; same pattern as torbox-range.yml). The control
+# file is {"parts": []} for all parts, or {"parts": [3, 5]} to re-run only
+# those parts. workflow_dispatch is kept for manual runs from the GitHub UI.
+#
+# DATA SOURCE: the TorBox SOURCE_URL secret (same secret torbox-range.yml
+# uses). The runner range-reads Jimmy Two-Shoes files straight out of the zip and
+# packs them into ~1.9 GB .tar parts. Nothing else is downloaded.
+#
+# TARGET: mhvnsnt/cn-gigaleak-jimmy-two-shoes, release jimmy-two-shoes-complete-v1
+# (id 454663799, created 2026-11-22). Uploads use secrets.TARGET_PAT
+# (fine-grained PAT, Contents: RW). The `probe` job uploads a small
+# progress file FIRST: if the PAT is not scoped to the jimmy-two-shoes repo, the
+# run stops here with a clear error instead of burning 18 extraction jobs.
+#
+# RESUME: each part job skips when its part asset + manifest already exist
+# on the release with matching sha256 (see jimmy_two_shoes_extract.py).
+
+name: jimmy-two-shoes-extract
+
+on:
+  push:
+    branches: [main]
+    paths: ["runs-jimmy-two-shoes/*.json"]
+  workflow_dispatch:
+    inputs:
+      parts:
+        description: "JSON list of part numbers, e.g. [3,5]; empty = all parts"
+        type: string
+        default: "[]"
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.parts.outputs.matrix }}
+      count: ${{ steps.parts.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compute part boundaries from the CD list
+        id: parts
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            F=$(ls runs-jimmy-two-shoes/*.json | sort | tail -1)
+            echo "control file: $F"
+            WANT=$(jq -c '.parts // []' "$F")
+          else
+            WANT='${{ inputs.parts }}'
+          fi
+          echo "wanted parts: $WANT"
+          python3 - "$WANT" <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, sys
+          CAP = 1900000000
+          want = json.loads(sys.argv[1]) if len(sys.argv) > 1 else []
+          entries = [l.rstrip("\n").split("\t") for l in open("jimmy-two-shoes-cd-full.tsv")]
+          parts, start, acc = [], 0, 0
+          for i, row in enumerate(entries):
+              u = int(row[4])
+              if acc + u > CAP and acc > 0:
+                  parts.append({"no": len(parts)+1, "start": start, "end": i,
+                                "name": f"jimmy-two-shoes-part-{len(parts)+1:02d}.tar"})
+                  start, acc = i, 0
+              acc += u
+          parts.append({"no": len(parts)+1, "start": start, "end": len(entries),
+                        "name": f"jimmy-two-shoes-part-{len(parts)+1:02d}.tar"})
+          if want:
+              parts = [p for p in parts if p["no"] in want]
+          print(f"matrix={json.dumps(parts)}")
+          print(f"count={len(parts)}")
+          EOF
+          echo "parts: ${{ steps.parts.outputs.count }}"
+
+  probe:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prove write access to the jimmy-two-shoes release
+        env:
+          GH_TOKEN: ${{ secrets.TARGET_PAT }}
+        run: |
+          RID=$(gh api repos/mhvnsnt/cn-gigaleak-jimmy-two-shoes/releases/tags/jimmy-two-shoes-complete-v1 --jq .id)
+          echo "jimmy-two-shoes release id: $RID"
+          printf "jimmy-two-shoes extraction started %s\n13 files / 278480586 bytes\n" "$(date -u +%FT%TZ)" > JIMMY-TWO-SHOES-EXTRACT-PROGRESS.txt
+          OLD=$(gh api --paginate "repos/mhvnsnt/cn-gigaleak-jimmy-two-shoes/releases/$RID/assets?per_page=100" \
+            | jq -rs '.[][] | select(.name=="JIMMY-TWO-SHOES-EXTRACT-PROGRESS.txt") | .id // empty' | head -1)
+          [ -n "$OLD" ] && gh api -X DELETE "repos/mhvnsnt/cn-gigaleak-jimmy-two-shoes/releases/assets/$OLD" || true
+          curl -sS --fail -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Content-Type: text/plain" \
+            --data-binary @JIMMY-TWO-SHOES-EXTRACT-PROGRESS.txt \
+            "https://uploads.github.com/repos/mhvnsnt/cn-gigaleak-jimmy-two-shoes/releases/$RID/assets?name=JIMMY-TWO-SHOES-EXTRACT-PROGRESS.txt"
+          echo "PROBE OK: TARGET_PAT can write to mhvnsnt/cn-gigaleak-jimmy-two-shoes"
+
+  extract:
+    needs: [prepare, probe]
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      max-parallel: 18
+      matrix:
+        part: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Runner headroom
+        run: df -h . && free -h && python3 --version
+      - name: Extract + upload part ${{ matrix.part.no }}
+        env:
+          SOURCE_URL: ${{ secrets.SOURCE_URL }}
+          GH_TOKEN: ${{ secrets.TARGET_PAT }}
+        run: |
+          python3 jimmy_two_shoes_extract.py --tsv jimmy-two-shoes-cd-full.tsv \
+            --start ${{ matrix.part.start }} --end ${{ matrix.part.end }} \
+            --part-no ${{ matrix.part.no }} --release-id 454663799
