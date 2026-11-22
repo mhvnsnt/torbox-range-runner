@@ -150,8 +150,15 @@ def main():
                     return 1
                 data, sha = b"", hashlib.sha256(b"").hexdigest()
             else:
-                lh = fetch(url, e["lho"], e["lho"] + 29)
-                if lh[:4] != b"PK\x03\x04":
+                lh = None
+                for _sig_try in range(3):
+                    cand = fetch(url, e["lho"], e["lho"] + 29)
+                    if cand[:4] == b"PK\x03\x04":
+                        lh = cand
+                        break
+                    print(f"  bad local sig try {_sig_try+1}/3 for {e['name']} — retrying", flush=True)
+                    time.sleep(5 * (_sig_try + 1))
+                if lh is None:
                     print(f"FAIL bad local sig: {e['name']}", file=sys.stderr, flush=True)
                     return 1
                 lfn, lef = struct.unpack_from("<HH", lh, 26)
