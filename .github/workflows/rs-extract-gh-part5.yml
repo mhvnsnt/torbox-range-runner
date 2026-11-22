@@ -1,0 +1,47 @@
+# Regular Show gap fill part 5 — GitHub slices source.
+#
+# Fallback after three TorBox timeout failures on part 5 (runs 45027315787,
+# 45028716458, 45030323213 — each stalled on one small range fetch after
+# 100-250 files, Errno 110 Connection timed out, different file each time).
+# TorBox itself probes healthy from outside; the stall is specific to the
+# runner -> TorBox path, so part 5 is re-run from the Documents.zip slice
+# assets on GitHub instead. No SOURCE_URL needed.
+#
+# TRIGGER: push a control file under runs-rs/gh-part5-*.json.
+# Part 5 = TSV rows 879..1484 (from run 45027315787's prepare matrix).
+# TARGET: mhvnsnt/cn-gigaleak-regular-show, release regular-show-gap-fill-v1
+# (id 454463027). Uploads use secrets.TARGET_PAT (Contents:RW on the target
+# repo AND read on mhvnsnt/cn-gigaleak-documents-archive). The gate job
+# fails fast if the PAT cannot read the slices repo.
+
+name: rs-extract-gh-part5
+
+on:
+  push:
+    branches: [main]
+    paths: ["runs-rs/gh-part5-*.json"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  part5:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - name: Gate — TARGET_PAT can read the slices repo
+        env:
+          GH_TOKEN: ${{ secrets.TARGET_PAT }}
+        run: |
+          gh api repos/mhvnsnt/cn-gigaleak-documents-archive/releases/tags/documents-zip-slices-v1 --jq '.id, .tag_name'
+          echo "GATE OK: TARGET_PAT can read the slices repo"
+      - name: Runner headroom
+        run: df -h . && free -h && python3 --version
+      - name: Extract part 5 from GitHub slices
+        env:
+          GH_TOKEN: ${{ secrets.TARGET_PAT }}
+        run: |
+          python3 rs_extract_gh.py --tsv rs-cd-full.tsv \
+            --start 879 --end 1484 --part-no 5 --release-id 454463027
