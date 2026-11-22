@@ -1,0 +1,135 @@
+# Adventure Time extraction — Documents.zip (TorBox SOURCE_URL) -> tar parts on
+# the adventure-time gap-fill release. Adapted from bakugan-extract.yml
+# (Bakugan lane, runs 45023736271 / 45024112890 / 45024631092 SUCCESS).
+#
+# TRIGGER: push a control file under runs-at/ (git push = Contents
+# permission, which works; same pattern as torbox-range.yml). The control
+# file is {"parts": []} for all parts, or {"parts": [3, 5]} to re-run only
+# those parts. workflow_dispatch is kept for manual runs from the GitHub UI.
+#
+# DATA SOURCE: the TorBox SOURCE_URL secret (same secret torbox-range.yml
+# uses). Mint a FRESH link with tb_reqdl.py (torrent 119449922, whole torrent,
+# no file_id) and `gh secret set SOURCE_URL` IMMEDIATELY before triggering —
+# a stale link 400s on the first range fetch (bakugan run 45023736271).
+# The runner range-reads Adventure Time files straight out of the zip and
+# packs them into ~1.9 GB .tar parts. Nothing else is downloaded.
+#
+# TARGET: mhvnsnt/cn-gigaleak-adventure-time, release adventure-time-gap-fill-v1
+# (id 454447035, created 2026-11-22). Uploads use secrets.TARGET_PAT
+# (fine-grained PAT, Contents: RW). The `probe` job uploads a small
+# progress file FIRST: if the PAT is not scoped to the adventure-time repo,
+# the run stops here with a clear error instead of burning extraction jobs.
+#
+# RESUME: each part job skips when its part asset + manifest already exist
+# on the release with matching sha256 (see at_extract.py).
+#
+# METHOD: all Adventure Time CD entries are method 0 (stored) — verified by
+# re-parsing the Documents.zip central directory (at-cd-full.tsv, 13,484
+# entries, method histogram {0: 13484}). at_extract.py fails hard on
+# method != 0, same as the Bakugan script. The Bearer-token curl fix from
+# bakugan commit bbc8b1bf (token interpolated in Python, never a literal
+# 'Bearer $TOKEN' header) is carried in at_extract.py — verify it is there
+# before triggering.
+
+name: at-extract
+
+on:
+  push:
+    branches: [main]
+    paths: ["runs-at/*.json"]
+  workflow_dispatch:
+    inputs:
+      parts:
+        description: "JSON list of part numbers, e.g. [3,5]; empty = all parts"
+        type: string
+        default: "[]"
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.parts.outputs.matrix }}
+      count: ${{ steps.parts.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compute part boundaries from the CD list
+        id: parts
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            F=$(ls runs-at/*.json | sort | tail -1)
+            echo "control file: $F"
+            WANT=$(jq -c '.parts // []' "$F")
+          else
+            WANT='${{ inputs.parts }}'
+          fi
+          echo "wanted parts: $WANT"
+          python3 - "$WANT" <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, sys
+          CAP = 1900000000
+          want = json.loads(sys.argv[1]) if len(sys.argv) > 1 else []
+          entries = [l.rstrip("\n").split("\t") for l in open("at-cd-full.tsv")]
+          parts, start, acc = [], 0, 0
+          for i, row in enumerate(entries):
+              u = int(row[4])
+              if acc + u > CAP and acc > 0:
+                  parts.append({"no": len(parts)+1, "start": start, "end": i,
+                                "name": f"at-gap-fill-part-{len(parts)+1:02d}.tar"})
+                  start, acc = i, 0
+              acc += u
+          parts.append({"no": len(parts)+1, "start": start, "end": len(entries),
+                        "name": f"at-gap-fill-part-{len(parts)+1:02d}.tar"})
+          if want:
+              parts = [p for p in parts if p["no"] in want]
+          print(f"matrix={json.dumps(parts)}")
+          print(f"count={len(parts)}")
+          EOF
+          echo "parts: ${{ steps.parts.outputs.count }}"
+
+  probe:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prove write access to the adventure-time release
+        env:
+          GH_TOKEN: ${{ secrets.TARGET_PAT }}
+        run: |
+          RID=$(gh api repos/mhvnsnt/cn-gigaleak-adventure-time/releases/tags/adventure-time-gap-fill-v1 --jq .id)
+          echo "adventure-time release id: $RID"
+          printf "adventure-time gap-fill extraction started %s\n" "$(date -u +%FT%TZ)" > AT-EXTRACT-PROGRESS.txt
+          OLD=$(gh api --paginate "repos/mhvnsnt/cn-gigaleak-adventure-time/releases/$RID/assets?per_page=100" \
+            | jq -rs '.[][] | select(.name=="AT-EXTRACT-PROGRESS.txt") | .id // empty' | head -1)
+          [ -n "$OLD" ] && gh api -X DELETE "repos/mhvnsnt/cn-gigaleak-adventure-time/releases/assets/$OLD" || true
+          curl -sS --fail -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Content-Type: text/plain" \
+            --data-binary @AT-EXTRACT-PROGRESS.txt \
+            "https://uploads.github.com/repos/mhvnsnt/cn-gigaleak-adventure-time/releases/$RID/assets?name=AT-EXTRACT-PROGRESS.txt"
+          echo "PROBE OK: TARGET_PAT can write to mhvnsnt/cn-gigaleak-adventure-time"
+
+  extract:
+    needs: [prepare, probe]
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      max-parallel: 18
+      matrix:
+        part: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Runner headroom
+        run: df -h . && free -h && python3 --version
+      - name: Extract + upload part ${{ matrix.part.no }}
+        env:
+          SOURCE_URL: ${{ secrets.SOURCE_URL }}
+          GH_TOKEN: ${{ secrets.TARGET_PAT }}
+        run: |
+          python3 at_extract.py --tsv at-cd-full.tsv \
+            --start ${{ matrix.part.start }} --end ${{ matrix.part.end }} \
+            --part-no ${{ matrix.part.no }} --release-id 454447035
