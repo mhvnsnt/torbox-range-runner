@@ -27,7 +27,7 @@ def redacted(url):
     p = _up.urlsplit(url)
     return f"{p.scheme}://{p.netloc}{p.path} (query redacted)"
 
-def fetch(url, start, end, tries=5):
+def fetch(url, start, end, tries=8):
     """GET byte range [start, end] inclusive; returns bytes."""
     last = None
     for a in range(tries):
@@ -40,7 +40,7 @@ def fetch(url, start, end, tries=5):
             return data
         except Exception as e:
             last = e
-            time.sleep(2 * (a + 1))
+            time.sleep(5 * (a + 1))
     raise RuntimeError(f"fetch failed [{start},{end}] after {tries}: {last}")
 
 def fetch_chunks(url, start, end):
@@ -171,6 +171,12 @@ def main():
             ti.mtime = 0
             tf.addfile(ti, io.BytesIO(data))
             recs.append((sha, e["usize"], e["crc"], e["name"], tp))
+            # RATE_LIMIT_DELAY: TorBox CDN throttles/bans a client that
+            # fires too many rapid range requests (parts 2/4 died at
+            # 3.75-10 files/s after ~150 files / ~300 requests, while
+            # parts 1/3 at ~1.7-1.9 files/s on the same host were fine).
+            # 0.75 s/file keeps the rate near ~1.2 files/s.
+            time.sleep(0.75)
             if (i + 1) % 25 == 0 or i == len(part_entries) - 1:
                 el = time.time() - t0
                 print(f"  {i+1}/{len(part_entries)} files in {el:.0f}s", flush=True)
