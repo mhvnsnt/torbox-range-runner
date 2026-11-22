@@ -1,31 +1,34 @@
 #!/usr/bin/env python3
-"""Runner-side HB Classics gap-fill extractor — GITHUB SLICES source
-(GitHub Actions). Fallback for parts 01, 04, 05 after TorBox transport
-failures on run 45036909671 (part 1: Errno 110 timeout on an 8.4 MB fetch;
-part 4: Errno 110 timeout on a 182 KB fetch; part 5: Errno 111 connection
-refused on a 30 B header fetch — different file each time, TorBox itself
-healthy, parts 02/03/06 succeeded on the same link). The stall is specific
-to the runner -> TorBox path, so the failed parts are re-run from the
-Documents.zip slice assets on GitHub instead. No SOURCE_URL needed.
+"""Runner-side HB Classics gap-fill extractor — GITHUB SLICES source,
+SPAN-BATCHED fetch (GitHub Actions). v2.
 
-Range-reads one tar part's worth of missing HB Classics files
-(method 0 / stored in Documents.zip) from the Documents.zip SLICE assets
-on GitHub (mhvnsnt/cn-gigaleak-documents-archive, release
-documents-zip-slices-v1) via the API asset endpoint + Range header,
-verifies CRC32 per file, packs them into an uncompressed .tar part,
+History: v1 (rs_extract_gh.py pattern) fetched each file with a separate
+30 B header request + 8 MB data chunks — ~2 requests per file, ~5,300
+requests per part. Three parallel parts (~16,000 requests in ~6 min)
+tripped the GitHub API rate limit for user 197314870 (run 45041468297:
+parts 04/05 failed HTTP 403 on slice asset 660522431; part 01 succeeded).
+v2 groups consecutive-in-lho files into <=48 MB spans and fetches each
+span with ONE API request, carving files out of the span buffer in memory.
+Request count drops to ~40-200 per part (part 04: 40 data-spans touched
+by lho, part 05: 46). Files tile contiguously in lho order (median gap 0),
+so spans are almost entirely HB data.
+
+Source: Documents.zip SLICE assets on GitHub
+(mhvnsnt/cn-gigaleak-documents-archive, release documents-zip-slices-v1)
+via the API asset endpoint + Range header. No SOURCE_URL needed.
+Verifies CRC32 per file, packs them into an uncompressed .tar part,
 uploads it + its manifest to the cartoon-vault hb-classics-gap-fill-v1
 release, and verifies both assets via the API. Skip logic: if the part
 asset AND its manifest already exist and the manifest's recorded
 part-sha256 matches the asset digest, the part is done — exit 0.
 
-Adapted from rs_extract_gh.py (proven on Regular Show part 5, run
-45032519075, ~6 min). The token is interpolated in Python in upload_file
-— NEVER pass a literal 'Bearer $TOKEN' to curl.
+The token is interpolated in Python in upload_file — NEVER pass a literal
+'Bearer $TOKEN' to curl.
 
 Env: GH_TOKEN (TARGET_PAT, Contents:RW on the target repo AND read on the
 slices repo).
-Usage: hb_classics_extract_gh.py --tsv hb-classics-cd-full.tsv --start 0 --end 173
-       --part-no 1 [--release-id 454521048]
+Usage: hb_classics_extract_gh.py --tsv hb-classics-cd-full.tsv --start 4069 --end 6905
+       --part-no 4 [--release-id 454521048]
 """
 import argparse, hashlib, io, json, os, struct, subprocess, sys, tarfile, time, urllib.request, zlib
 
@@ -34,7 +37,8 @@ RELEASE_ID_DEFAULT = 454521048
 PART_CAP = 1900000000
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-CHUNK = 8 * 1024 * 1024
+GROUP_CAP = 48 * 1024 * 1024
+EXTRA_SLACK = 256  # assumed max local-header extra length for grouping estimates
 
 SRC_REPO = "mhvnsnt/cn-gigaleak-documents-archive"
 SLICE = 2000000000
@@ -74,7 +78,7 @@ def fetch_asset_range(token, aid, start, end, tries=5):
             time.sleep(2 * (a + 1))
     raise RuntimeError(f"fetch failed asset {aid} [{start},{end}] after {tries}: {last}")
 
-def fetch_zip(token, start, end, tries=5):
+def fetch_zip_span(token, start, end, tries=5):
     """GET byte range [start, end] inclusive of the whole Documents.zip, split across slices."""
     smap = slice_map()
     out = bytearray()
@@ -86,12 +90,68 @@ def fetch_zip(token, start, end, tries=5):
         pos = send + 1
     return bytes(out)
 
-def fetch_zip_chunks(token, start, end):
+def fetch_span_chunked(token, start, end, chunk=48 * 1024 * 1024):
+    """Fetch [start, end] inclusive in <=chunk API requests (a single huge
+    Range request risks timeouts; v1 never tested >8 MB in one request).
+    Splits by slice inside fetch_zip_span as needed."""
+    out = bytearray()
     pos = start
     while pos <= end:
-        n = min(CHUNK, end - pos + 1)
-        yield fetch_zip(token, pos, pos + n - 1)
-        pos += n
+        out += fetch_zip_span(token, pos, min(end, pos + chunk - 1))
+        pos += chunk
+    return bytes(out)
+
+def est_end(e):
+    """Estimated exclusive end of a file's zip record (header + data).
+    Name byte length uses UTF-8 (an over-estimate vs cp437, exact vs UTF-8);
+    extra length is assumed <= EXTRA_SLACK (tail fallback covers the rare
+    overrun). Used ONLY for grouping, never for correctness."""
+    return e["lho"] + 30 + len(e["name"].encode("utf-8", "replace")) + EXTRA_SLACK + e["csize"]
+
+def build_groups(entries):
+    """Group consecutive-in-lho files into spans of <= GROUP_CAP bytes
+    (estimated). Returns list of (group_start, group_end_est, [entries])."""
+    ordered = sorted(entries, key=lambda e: e["lho"])
+    groups, cur, cur_start, cur_end = [], [], None, 0
+    for e in ordered:
+        ee = est_end(e)
+        if cur and ee - cur_start > GROUP_CAP:
+            groups.append((cur_start, cur_end, cur))
+            cur, cur_start, cur_end = [], None, 0
+        if not cur:
+            cur_start = e["lho"]
+        cur.append(e)
+        cur_end = max(cur_end, ee)
+    if cur:
+        groups.append((cur_start, cur_end, cur))
+    return groups
+
+def carve_file(token, g_start, buf, e):
+    """Parse one file's local header from the group buffer (which starts at
+    g_start) and return its data bytes, extending the buffer with a tail
+    fetch if the estimate undershot. Verifies size + CRC32."""
+    off = e["lho"] - g_start
+    if off + 30 > len(buf) or buf[off:off+4] != b"PK\x03\x04":
+        raise RuntimeError(f"bad local sig for {e['name']} at lho {e['lho']}")
+    lfn, lef = struct.unpack_from("<HH", buf, off + 26)
+    ds = e["lho"] + 30 + lfn + lef
+    de = ds + e["csize"]
+    if e["usize"] == 0:
+        if e["crc"] != 0:
+            raise RuntimeError(f"zero-size nonzero CRC: {e['name']}")
+        return b""
+    end_off = de - g_start
+    if end_off > len(buf):
+        # estimate undershot (extra field > slack, or name longer than
+        # estimated): fetch the missing tail and extend the buffer
+        extra = fetch_zip_span(token, g_start + len(buf), de - 1)
+        buf = buf + extra
+    data = buf[ds - g_start:de - g_start]
+    if len(data) != e["usize"]:
+        raise RuntimeError(f"size mismatch: {e['name']} got {len(data)} want {e['usize']}")
+    if (zlib.crc32(data) & 0xFFFFFFFF) != e["crc"]:
+        raise RuntimeError(f"CRC mismatch: {e['name']}")
+    return data
 
 def load_entries(tsv):
     entries = []
@@ -151,7 +211,7 @@ def main():
         print("ERROR: GH_TOKEN env not set", file=sys.stderr)
         return 2
     smap = slice_map()
-    print(f"source: GitHub slices ({len(smap)} slice assets, {SRC_REPO})", flush=True)
+    print(f"source: GitHub slices, span-batched ({len(smap)} slice assets, {SRC_REPO})", flush=True)
     entries = load_entries(args.tsv)
     part_entries = entries[args.start:args.end]
     part_name = f"hb-classics-gap-fill-part-{args.part_no:02d}.tar"
@@ -179,44 +239,34 @@ def main():
                         return 0
                     print(f"digest mismatch (release {existing['digest']} vs manifest {want}) — rebuilding", flush=True)
                     break
-    # extract + pack
+    # extract + pack (span-batched, files processed in lho order)
     t0 = time.time()
+    groups = build_groups(part_entries)
+    print(f"  {len(groups)} span groups (<=48 MB each) for {len(part_entries)} files", flush=True)
     recs = []
+    nreq = 0
     with tarfile.open(part_path, "w", format=tarfile.GNU_FORMAT) as tf:
-        for i, e in enumerate(part_entries):
-            if e["method"] != 0:
-                print(f"FAIL unsupported method {e['method']}: {e['name']}", file=sys.stderr, flush=True)
-                return 1
-            if e["usize"] == 0:
-                if e["crc"] != 0:
-                    print(f"FAIL zero-size nonzero CRC: {e['name']}", file=sys.stderr, flush=True)
+        done = 0
+        for gi, (g_start, g_end, g_files) in enumerate(groups):
+            buf = fetch_span_chunked(token, g_start, g_end - 1)
+            nreq += 1
+            for e in g_files:
+                if e["method"] != 0:
+                    print(f"FAIL unsupported method {e['method']}: {e['name']}", file=sys.stderr, flush=True)
                     return 1
-                data, sha = b"", hashlib.sha256(b"").hexdigest()
-            else:
-                lh = fetch_zip(token, e["lho"], e["lho"] + 29)
-                if lh[:4] != b"PK\x03\x04":
-                    print(f"FAIL bad local sig: {e['name']}", file=sys.stderr, flush=True)
-                    return 1
-                lfn, lef = struct.unpack_from("<HH", lh, 26)
-                ds = e["lho"] + 30 + lfn + lef
-                buf, crc = io.BytesIO(), 0
-                for chunk in fetch_zip_chunks(token, ds, ds + e["csize"] - 1):
-                    buf.write(chunk)
-                    crc = zlib.crc32(chunk, crc)
-                data = buf.getvalue()
-                if len(data) != e["usize"] or (crc & 0xFFFFFFFF) != e["crc"]:
-                    print(f"FAIL size/CRC: {e['name']}", file=sys.stderr, flush=True)
-                    return 1
+                data = carve_file(token, g_start, buf, e)
                 sha = hashlib.sha256(data).hexdigest()
-            tp = e["name"][len("Documents/"):]
-            ti = tarfile.TarInfo(tp)
-            ti.size = len(data)
-            ti.mtime = 0
-            tf.addfile(ti, io.BytesIO(data))
-            recs.append((sha, e["usize"], e["crc"], e["name"], tp))
-            if (i + 1) % 25 == 0 or i == len(part_entries) - 1:
-                el = time.time() - t0
-                print(f"  {i+1}/{len(part_entries)} files in {el:.0f}s", flush=True)
+                tp = e["name"][len("Documents/"):]
+                ti = tarfile.TarInfo(tp)
+                ti.size = len(data)
+                ti.mtime = 0
+                tf.addfile(ti, io.BytesIO(data))
+                recs.append((sha, e["usize"], e["crc"], e["name"], tp))
+                done += 1
+                if done % 500 == 0 or done == len(part_entries):
+                    el = time.time() - t0
+                    print(f"  {done}/{len(part_entries)} files in {el:.0f}s (group {gi+1}/{len(groups)})", flush=True)
+    print(f"  span groups fetched: {len(groups)} (+ rare tail fetches)", flush=True)
     psize = os.path.getsize(part_path)
     psha = hashlib.sha256()
     with open(part_path, "rb") as f:
