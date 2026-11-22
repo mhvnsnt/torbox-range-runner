@@ -1,0 +1,126 @@
+# HB Classics extraction — Documents.zip -> tar parts on the cartoon-vault release.
+#
+# TRIGGER: push a control file under runs-hb-classics/ (git push = Contents
+# permission, which works; same pattern as torbox-range.yml). The control
+# file is {"parts": []} for all parts, or {"parts": [3, 5]} to re-run only
+# those parts. workflow_dispatch is kept for manual runs from the GitHub UI.
+#
+# DATA SOURCE: the TorBox SOURCE_URL secret (same secret torbox-range.yml
+# uses). The runner range-reads HB Classics files straight out of the zip and
+# packs them into ~1.9 GB .tar parts. Nothing else is downloaded.
+#
+# TARGET: mhvnsnt/cn-gigaleak-cartoon-vault, release hb-classics-gap-fill-v1
+# (id 454521048, created 2026-11-22). Uploads use secrets.TARGET_PAT
+# (fine-grained PAT, Contents: RW). The `probe` job uploads a small
+# progress file FIRST: if the PAT is not scoped to the cartoon-vault repo, the
+# run stops here with a clear error instead of burning extraction jobs.
+#
+# RESUME: each part job skips when its part asset + manifest already exist
+# on the release with matching sha256 (see hb_classics_extract.py).
+#
+# FALLBACK: if TorBox range fetches stall on the runner (Errno 110, different
+# file each time), route-switch to the GitHub-slices extractor pattern
+# (rs_extract_gh.py + rs-extract-gh-part5.yml) — do NOT re-run the same failure.
+
+name: hb-classics-extract
+
+on:
+  push:
+    branches: [main]
+    paths: ["runs-hb-classics/*.json"]
+  workflow_dispatch:
+    inputs:
+      parts:
+        description: "JSON list of part numbers, e.g. [3,5]; empty = all parts"
+        type: string
+        default: "[]"
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.parts.outputs.matrix }}
+      count: ${{ steps.parts.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compute part boundaries from the CD list
+        id: parts
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            F=$(ls runs-hb-classics/*.json | sort | tail -1)
+            echo "control file: $F"
+            WANT=$(jq -c '.parts // []' "$F")
+          else
+            WANT='${{ inputs.parts }}'
+          fi
+          echo "wanted parts: $WANT"
+          python3 - "$WANT" <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, sys
+          CAP = 1900000000
+          want = json.loads(sys.argv[1]) if len(sys.argv) > 1 else []
+          entries = [l.rstrip("\n").split("\t") for l in open("hb-classics-cd-full.tsv")]
+          parts, start, acc = [], 0, 0
+          for i, row in enumerate(entries):
+              u = int(row[4])
+              if acc + u > CAP and acc > 0:
+                  parts.append({"no": len(parts)+1, "start": start, "end": i,
+                                "name": f"hb-classics-gap-fill-part-{len(parts)+1:02d}.tar"})
+                  start, acc = i, 0
+              acc += u
+          parts.append({"no": len(parts)+1, "start": start, "end": len(entries),
+                        "name": f"hb-classics-gap-fill-part-{len(parts)+1:02d}.tar"})
+          if want:
+              parts = [p for p in parts if p["no"] in want]
+          print(f"matrix={json.dumps(parts)}")
+          print(f"count={len(parts)}")
+          EOF
+          echo "parts: ${{ steps.parts.outputs.count }}"
+
+  probe:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prove write access to the cartoon-vault release
+        env:
+          GH_TOKEN: ${{ secrets.TARGET_PAT }}
+        run: |
+          RID=$(gh api repos/mhvnsnt/cn-gigaleak-cartoon-vault/releases/tags/hb-classics-gap-fill-v1 --jq .id)
+          echo "hb-classics release id: $RID"
+          printf "hb-classics gap-fill extraction started %s\n" "$(date -u +%FT%TZ)" > HB-CLASSICS-EXTRACT-PROGRESS.txt
+          OLD=$(gh api --paginate "repos/mhvnsnt/cn-gigaleak-cartoon-vault/releases/$RID/assets?per_page=100" \
+            | jq -rs '.[][] | select(.name=="HB-CLASSICS-EXTRACT-PROGRESS.txt") | .id // empty' | head -1)
+          [ -n "$OLD" ] && gh api -X DELETE "repos/mhvnsnt/cn-gigaleak-cartoon-vault/releases/assets/$OLD" || true
+          curl -sS --fail -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Content-Type: text/plain" \
+            --data-binary @HB-CLASSICS-EXTRACT-PROGRESS.txt \
+            "https://uploads.github.com/repos/mhvnsnt/cn-gigaleak-cartoon-vault/releases/$RID/assets?name=HB-CLASSICS-EXTRACT-PROGRESS.txt"
+          echo "PROBE OK: TARGET_PAT can write to mhvnsnt/cn-gigaleak-cartoon-vault"
+
+  extract:
+    needs: [prepare, probe]
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    strategy:
+      fail-fast: false
+      max-parallel: 18
+      matrix:
+        part: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Runner headroom
+        run: df -h . && free -h && python3 --version
+      - name: Extract + upload part ${{ matrix.part.no }}
+        env:
+          SOURCE_URL: ${{ secrets.SOURCE_URL }}
+          GH_TOKEN: ${{ secrets.TARGET_PAT }}
+        run: |
+          python3 hb_classics_extract.py --tsv hb-classics-cd-full.tsv \
+            --start ${{ matrix.part.start }} --end ${{ matrix.part.end }} \
+            --part-no ${{ matrix.part.no }} --release-id 454521048
